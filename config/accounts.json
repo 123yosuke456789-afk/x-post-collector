@@ -1,0 +1,24 @@
+{
+  "accounts": [
+    "nhk_news",
+    "Asahi_Shakai",
+    "mainichi",
+    "yomiuri_online",
+    "nikkei",
+    "Reuters",
+    "bbcnewsjapan",
+    "CNN",
+    "weathernews",
+    "JMA_kishou",
+    "tokyometro_info",
+    "JR_East",
+    "ANA_official",
+    "JAL_official",
+    "SoftBank_Corp",
+    "docomo_jp",
+    "au_official",
+    "rakuten",
+    "amazon_jp",
+    "Yahoo_JAPAN_PR"
+  ]
+}
