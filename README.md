@@ -135,9 +135,9 @@ X_BEARER_TOKEN=AAAAAAAAAAAA...
 
 | 項目 | 意味 |
 |---|---|
-| `settings.include_media` | `true` で画像・動画 URL も取得（料金が上がる）／`false` で取得しない |
-| `accounts` | 監視するアカウントの配列。文字列だけでもOK（その場合 priority は `normal` 扱い） |
-| `priority` | `high` / `normal` / `low` の3段階。実行時に `--priority high` で絞り込める |
+| メディア取得（`settings.include_media`） | `true` で画像・動画 URL も取得（料金が上がる）／`false` で取得しない |
+| 監視対象アカウント（`accounts`） | 監視するアカウントの配列。文字列だけでもOK（その場合 priority は `normal` 扱い） |
+| 優先度（`priority`） | `high` / `normal` / `low` の3段階。実行時に `--priority high` で絞り込める |
 
 **この2ファイルを書き換えるだけで運用変更が完結します。コード修正は一切不要です。**
 
@@ -224,6 +224,21 @@ data/
   ]
 }
 ```
+
+### `manifest.json` の主なフィールド
+
+| 項目 | 意味 |
+|---|---|
+| 実行時刻（`run_at`） | この実行を開始したタイムスタンプ |
+| メディア取得設定（`include_media`） | この実行でメディアを取得したか（`true`/`false`） |
+| 監視アカウント数（`account_count`） | この実行で対象としたアカウント数 |
+| バッチ数（`batch_count`） | OR クエリで分割したバッチ数 |
+| 失敗バッチ数（`failed_batches`） | エラーで完了しなかったバッチ数 |
+| 取得ポスト総数（`total_tweets`） | この実行で取得したポスト件数 |
+| 所要時間（`elapsed_seconds`） | 実行にかかった秒数 |
+| 推定課金額（`estimated_cost.total_usd`） | この実行で発生したと推定される料金（USD） |
+| アカウント別件数（`by_account`） | アカウントごとの取得件数とファイルパス |
+| バッチごとの結果（`batches`） | 各バッチの状態・件数・保存パスの配列 |
 
 各バッチのステータスは3種類：
 
