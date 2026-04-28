@@ -389,16 +389,16 @@ cat logs/2026-04-28.log         # 当日のログ詳細
 
 ```mermaid
 flowchart TD
-    A[accounts.json<br/>監視対象リスト] --> B[collector.py]
-    E[.env<br/>Bearer Token] --> B
+    A[accounts.json<br/>監視対象リスト] --> B[collector.py<br/>メイン処理]
+    E[.env<br/>API 認証情報] --> B
 
     B --> C{ユーザーキャッシュ<br/>あるか?}
-    C -- なし --> D[GET /2/users/by<br/>username→user_id 取得]
+    C -- なし --> D[ユーザー情報を初回取得<br/>GET /2/users/by]
     D --> F[users_cache.json<br/>永続保存]
     C -- あり --> G
 
-    F --> G[OR クエリでバッチ化<br/>30〜40アカウント/バッチ]
-    G --> H[search_recent_tweets<br/>since_id + next_token ループ]
+    F --> G[複数アカウントを1リクエストにまとめる<br/>OR クエリ・30〜40件/バッチ]
+    G --> H[ポスト取得 Search API<br/>前回取得位置以降のみ・全件まで自動継続]
     H --> I[raw/batch_NNN.json<br/>API 生レスポンス]
     H --> J[tweets/batch_NNN.json<br/>整形済み]
     H --> K[by_account/USERNAME.json<br/>アカウント別ビュー]
