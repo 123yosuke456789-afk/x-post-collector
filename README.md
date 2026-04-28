@@ -6,7 +6,9 @@
 
 X（旧Twitter）の指定したアカウント群の最新ポストを、決まった時間に自動で取得して JSON ファイルに保存するツールです。約1000アカウント・1日2回の定期取得を想定し、**API 利用料金を可能な限り抑える設計** にしてあります。
 
-**動作環境**: Python 3.11 以上（macOS / Linux / Windows どれでも動作可能）
+**動作確認済み環境**: macOS 14（Apple Silicon） / Linux（GitHub Actions の CI）／ Python 3.11 + 3.12
+
+> **Windows について**：Python 自体は動作しますが、付属のシェルスクリプト（`setup.sh` / `run.sh` / `status.sh`）は bash 前提のため、**Git Bash または WSL（Windows Subsystem for Linux）が必要**です。Windows ネイティブ環境での動作確認は行っていません。
 
 ---
 
@@ -67,8 +69,6 @@ git をお使いでない方：[このページの緑色「Code」ボタン → 
 
 ### セットアップ・実行
 
-#### macOS / Linux / Windows（Git Bash・WSL）の方
-
 ```bash
 bash setup.sh          # 必要なものを自動でインストール
 # 表示される指示に従って .env に Bearer Token を貼り付ける
@@ -77,29 +77,13 @@ bash run.sh            # 本番実行
 bash status.sh         # 取得結果を見やすく表示
 ```
 
-#### Windows（cmd / PowerShell のみ・bash を使わない場合）
-
-```powershell
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-notepad .env                       # X_BEARER_TOKEN を編集
-
-python collector.py --dry-run      # API を呼ばずに動作確認
-python collector.py                # 本番実行
-python status.py                   # 取得結果を見やすく表示
-```
-
-> シェルスクリプト（`setup.sh` / `run.sh` / `status.sh`）は Git Bash か WSL が必要ですが、コア処理（`collector.py` / `status.py`）は純 Python なので **`python` コマンドだけで全機能が使えます**。
-
 > **Bearer Token とは**：X API を使うための「合言葉」のような認証情報です。[X Developer Portal](https://developer.x.com) でアプリを作成すると発行されます。
 
 ---
 
 ## 動くとどうなるか（実行例）
 
-`bash status.sh`（または Windows の場合 `python status.py`）を実行すると、こんな出力が出ます：
+`bash status.sh` を実行すると、こんな出力が出ます：
 
 ```
 📋 ユーザーキャッシュ: 1000 件
@@ -161,23 +145,13 @@ X_BEARER_TOKEN=AAAAAAAAAAAA...
 
 ## 使い方（コマンド一覧）
 
-`run.sh` 経由（macOS / Linux / Git Bash）：
+`run.sh` 経由（推奨）：
 
 ```bash
 bash run.sh                                       # 全アカウント取得
 bash run.sh --priority high                       # 高優先度だけ取得
 bash run.sh --accounts config/accounts_test.json  # 別の設定ファイルを指定
 bash run.sh --dry-run                             # API を呼ばずに動作確認
-```
-
-Python 直接実行（Windows の cmd / PowerShell でも使用可）：
-
-```bash
-python collector.py
-python collector.py --priority high
-python collector.py --accounts config/accounts_test.json
-python collector.py --dry-run
-python status.py                                  # 取得状況を見やすく表示
 ```
 
 ### 推奨される運用パターン
@@ -189,6 +163,18 @@ python status.py                                  # 取得状況を見やすく�
 | `high`   | 6時間ごと（1日4回） | ニュース速報・公式発表 |
 | `normal` | 12時間ごと（1日2回） | 通常のキャッチアップ |
 | `low`    | 24時間ごと（1日1回） | 重要度の低いアカウント |
+
+<details>
+<summary>Python コマンドを直接使う場合</summary>
+
+```bash
+python collector.py
+python collector.py --priority high
+python collector.py --accounts config/accounts_test.json
+python collector.py --dry-run
+```
+
+</details>
 
 ---
 
