@@ -5,15 +5,19 @@ X Post Collector
 X (旧Twitter) の指定アカウント群の最新ポストを定期取得・保存するツール。
 
 【依頼仕様への対応】
-- 1000アカウントを OR クエリでバッチ化し、1日のリクエスト数を最小化
+- 1000アカウントを OR クエリでバッチ化し、リクエスト数を最小化
 - raw API レスポンスを raw/ 配下にそのまま保存（後段の再処理用）
 - 加工版を tweets/ 配下に保存（すぐに使える形式）
-- アカウント別ビューを by_account/ 配下に生成（アカウント単位で追える）
-- 1実行ごとに manifest.json を生成（後段システムが内容を素早く把握できる）
+- アカウント別ビューを by_account/ 配下に生成
+- 1実行ごとに manifest.json を生成（取得件数・推定コスト等）
 - 設定ファイル（config/accounts.json）でアカウント追加・停止が可能
 - 優先度（high/normal/low）でフィルタ実行が可能
-- アトミック書き込み（temp + rename）で途中失敗時のデータ破損を防止
-- レートリミット時の待機・リトライ、一部バッチ失敗でも全体は完走
+- 取りこぼし防止: next_token ページネーション対応
+- コスト最適化:
+  - ユーザー情報の事前キャッシュ（毎回の expansion を避ける）
+  - メディア取得を ON/OFF で切替可能
+- アトミック書き込み（temp + rename）でデータ破損防止
+- レートリミット時の待機・リトライ
 """
 
 import json
@@ -31,16 +35,24 @@ from dotenv import load_dotenv
 # 定数
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR    = Path(__file__).parent
-CONFIG_PATH   = SCRIPT_DIR / "config" / "accounts.json"
-DATA_DIR      = SCRIPT_DIR / "data"
-LOG_DIR       = SCRIPT_DIR / "logs"
-SINCE_ID_PATH = DATA_DIR / "since_ids.json"
+SCRIPT_DIR        = Path(__file__).parent
+CONFIG_PATH       = SCRIPT_DIR / "config" / "accounts.json"
+DATA_DIR          = SCRIPT_DIR / "data"
+LOG_DIR           = SCRIPT_DIR / "logs"
+SINCE_ID_PATH     = DATA_DIR / "since_ids.json"
+USERS_CACHE_PATH  = DATA_DIR / "users_cache.json"
 
-MAX_QUERY_LENGTH      = 480   # X Search API のクエリ文字数上限（余裕を見た値）
+MAX_QUERY_LENGTH        = 480
 RATE_LIMIT_WAIT_SECONDS = 60
-MAX_RESULTS_PER_BATCH = 100
-VALID_PRIORITIES = {"high", "normal", "low"}
+MAX_RESULTS_PER_BATCH   = 100
+MAX_PAGES_PER_BATCH     = 10   # ページネーションの安全弁
+USERS_LOOKUP_CHUNK      = 100  # GET /2/users/by の1リクエスト上限
+VALID_PRIORITIES        = {"high", "normal", "low"}
+
+# X API Pay-Per-Use 単価（2026-04 時点）
+COST_PER_POST_READ  = 0.005
+COST_PER_USER_READ  = 0.010
+COST_PER_MEDIA_READ = 0.005
 
 # ---------------------------------------------------------------------------
 # ログ設定
@@ -66,9 +78,7 @@ log = logging.getLogger(__name__)
 def normalize_accounts(raw_accounts: list) -> list[dict]:
     """
     accounts.json の中身を正規形 [{"username": ..., "priority": ...}, ...] に変換する。
-
-    旧形式（"username" 文字列）も新形式（{"username":..., "priority":...}）も受け入れる。
-    無効な priority 指定は "normal" にフォールバックする。
+    旧形式（"username" 文字列）も新形式（dict）も受け入れる。
     """
     normalized = []
     for item in raw_accounts:
@@ -122,9 +132,7 @@ def build_query(batch: list[str]) -> str:
 
 
 def atomic_write_text(path: Path, content: str) -> None:
-    """temp ファイルに書いてから rename で原子的に置き換える。
-    POSIX rename はアトミックなので、書き込み中にクラッシュしても本体は壊れない。
-    """
+    """temp に書いてから rename で原子的に置き換える。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
@@ -136,16 +144,35 @@ def atomic_write_json(path: Path, data) -> None:
     atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def estimate_cost_usd(
+    post_reads: int,
+    user_reads: int,
+    media_reads: int,
+) -> dict:
+    """
+    取得件数からX API課金額（USD）を見積もる純粋関数。
+    24h dedup は考慮しない（同一実行内では発生しない前提）。
+    """
+    posts = round(post_reads * COST_PER_POST_READ, 4)
+    users = round(user_reads * COST_PER_USER_READ, 4)
+    media = round(media_reads * COST_PER_MEDIA_READ, 4)
+    return {
+        "post_reads":     post_reads,
+        "user_reads":     user_reads,
+        "media_reads":    media_reads,
+        "posts_usd":      posts,
+        "users_usd":      users,
+        "media_usd":      media,
+        "total_usd":      round(posts + users + media, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # tweepy レスポンスのシリアライズ
 # ---------------------------------------------------------------------------
 
 def serialize_response(response) -> dict:
-    """
-    tweepy.Response を raw JSON 相当の dict に変換する。
-    各 tweepy オブジェクトは .data 属性に元のAPIレスポンスのdictを保持しているので、
-    それを取り出して raw に近い形を再構成する。
-    """
+    """tweepy.Response を raw JSON 相当の dict に変換する。"""
     return {
         "data":     [t.data for t in (response.data or [])],
         "includes": {
@@ -158,27 +185,45 @@ def serialize_response(response) -> dict:
     }
 
 
-def parse_tweets(response) -> list[dict]:
-    """response から、後段で扱いやすい形に整形した tweet リストを返す。"""
+def parse_tweets(
+    response,
+    user_id_to_username: dict[str, str] | None = None,
+    include_media: bool = True,
+) -> list[dict]:
+    """response から、後段で扱いやすい形に整形した tweet リストを返す。
+
+    user_id_to_username が渡された場合、それを優先して username を解決する
+    （expansions=author_id を使わない場合のフォールバック）。
+    include_media=False の場合、media フィールドは常に空リストになる。
+    """
     if not response.data:
         return []
 
+    # response.includes の users で解決（expansion を使った場合）
     users: dict[str, str] = {}
     if response.includes and "users" in response.includes:
         for user in response.includes["users"]:
             users[str(user.id)] = user.username
+    # キャッシュ由来のマッピングを優先（または補完）
+    if user_id_to_username:
+        for uid, uname in user_id_to_username.items():
+            users[str(uid)] = uname
 
     media_map: dict[str, dict] = {}
-    if response.includes and "media" in response.includes:
+    if include_media and response.includes and "media" in response.includes:
         for media in response.includes["media"]:
             url = getattr(media, "url", None) or getattr(media, "preview_image_url", None)
             media_map[media.media_key] = {"type": media.type, "url": url}
 
     tweets = []
     for tweet in response.data:
-        attachments = getattr(tweet, "attachments", None) or {}
-        media_keys = attachments.get("media_keys", []) if isinstance(attachments, dict) else []
-        media_urls = [media_map[k] for k in media_keys if k in media_map]
+        if include_media:
+            attachments = getattr(tweet, "attachments", None) or {}
+            media_keys = attachments.get("media_keys", []) if isinstance(attachments, dict) else []
+            media_urls = [media_map[k] for k in media_keys if k in media_map]
+        else:
+            media_urls = []
+
         tweets.append({
             "id":         str(tweet.id),
             "author_id":  str(tweet.author_id),
@@ -208,8 +253,83 @@ def save_since_ids(since_ids: dict[str, str]) -> None:
     atomic_write_json(SINCE_ID_PATH, since_ids)
 
 
+# ---------------------------------------------------------------------------
+# ユーザーキャッシュ：username ↔ user_id のマッピング
+# 一度取得すれば永続的に再利用できるため、ユーザー情報の課金を最小化する
+# ---------------------------------------------------------------------------
+
+def load_users_cache() -> dict[str, str]:
+    """username -> user_id のマップを返す。"""
+    if not USERS_CACHE_PATH.exists():
+        return {}
+    try:
+        cache = json.loads(USERS_CACHE_PATH.read_text(encoding="utf-8"))
+        return {
+            k: (v["id"] if isinstance(v, dict) else v)
+            for k, v in cache.get("users", {}).items()
+        }
+    except Exception as e:
+        log.warning(f"users_cache.json の読み込みに失敗: {e}")
+        return {}
+
+
+def save_users_cache(cache: dict[str, str]) -> None:
+    payload = {
+        "version": 1,
+        "saved_at": datetime.now().isoformat(),
+        "users": {
+            username: {"id": user_id}
+            for username, user_id in sorted(cache.items())
+        },
+    }
+    atomic_write_json(USERS_CACHE_PATH, payload)
+
+
+def ensure_users_cached(client, usernames: list[str]) -> tuple[dict[str, str], int]:
+    """
+    指定ユーザーが全てキャッシュにあることを保証する。なければ API で取得して追加する。
+    Returns: (username->user_id マップ, このコールで API から新規取得した数)
+    """
+    cache = load_users_cache()
+    missing = [u for u in usernames if u not in cache]
+    if not missing:
+        return cache, 0
+
+    log.info(f"  ユーザーキャッシュを更新します: 新規 {len(missing)} 件")
+
+    fetched = 0
+    for chunk_start in range(0, len(missing), USERS_LOOKUP_CHUNK):
+        chunk = missing[chunk_start:chunk_start + USERS_LOOKUP_CHUNK]
+        for attempt in range(3):
+            try:
+                response = client.get_users(usernames=chunk)
+                break
+            except tweepy.errors.TooManyRequests:
+                wait = RATE_LIMIT_WAIT_SECONDS * (attempt + 1)
+                log.warning(f"  user lookup レートリミット。{wait}秒後にリトライ（{attempt + 1}/3）")
+                time.sleep(wait)
+            except Exception as e:
+                log.error(f"  user lookup でエラー: {e}")
+                response = None
+                break
+        if response is None or not response.data:
+            log.warning(f"  ユーザー取得失敗 or 結果なし: chunk={chunk}")
+            continue
+        for user in response.data:
+            cache[user.username] = str(user.id)
+            fetched += 1
+        # APIエラーで取れなかった分も後で再試行できるように、見つからなかったユーザーも記録
+        found_usernames = {user.username for user in response.data}
+        for not_found in set(chunk) - found_usernames:
+            log.warning(f"  ユーザーが見つかりません（削除/凍結の可能性）: {not_found}")
+        time.sleep(0.5)
+
+    save_users_cache(cache)
+    log.info(f"  ユーザーキャッシュ更新完了: 追加 {fetched} 件 / 累計 {len(cache)} 件")
+    return cache, fetched
+
+
 def get_client() -> tweepy.Client:
-    """Bearer Token で認証した tweepy.Client を返す。"""
     load_dotenv(SCRIPT_DIR / ".env")
     bearer = os.getenv("X_BEARER_TOKEN")
     if not bearer or bearer.startswith("ここに"):
@@ -220,39 +340,113 @@ def get_client() -> tweepy.Client:
     return tweepy.Client(bearer_token=bearer, wait_on_rate_limit=False)
 
 
-def fetch_batch(client, batch: list[str], batch_index: int, since_id: str | None):
+# ---------------------------------------------------------------------------
+# 1ページ取得（リトライ付き）
+# ---------------------------------------------------------------------------
+
+def _call_search(
+    client,
+    query: str,
+    since_id: str | None,
+    pagination_token: str | None,
+    include_media: bool,
+):
     """
-    1バッチ分のポストを取得する。
-    Returns: (response or None, error_message or None)
+    search_recent_tweets を1回呼ぶ。リトライは外側で。
+    Returns: (response, error_message or None)
+    """
+    tweet_fields = ["created_at", "author_id", "text"]
+    if include_media:
+        tweet_fields.append("attachments")
+
+    expansions = []
+    media_fields = None
+    if include_media:
+        expansions.append("attachments.media_keys")
+        media_fields = ["url", "preview_image_url", "type"]
+
+    kwargs = {
+        "query":         query,
+        "max_results":   MAX_RESULTS_PER_BATCH,
+        "since_id":      since_id,
+        "tweet_fields":  tweet_fields,
+    }
+    if expansions:
+        kwargs["expansions"] = expansions
+    if media_fields:
+        kwargs["media_fields"] = media_fields
+    if pagination_token:
+        kwargs["next_token"] = pagination_token
+
+    try:
+        response = client.search_recent_tweets(**kwargs)
+        return response, None
+    except tweepy.errors.TooManyRequests:
+        return None, "TooManyRequests"
+    except tweepy.errors.TwitterServerError as e:
+        return None, f"TwitterServerError: {e}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def fetch_batch_with_pagination(
+    client,
+    batch: list[str],
+    batch_index: int,
+    since_id: str | None,
+    include_media: bool,
+    user_id_to_username: dict[str, str],
+):
+    """
+    1バッチ分を next_token でページネーションしながら取得する。
+
+    Returns:
+        (raw_responses_list, tweets_list, media_count, error or None)
     """
     query = build_query(batch)
     log.info(f"  バッチ {batch_index:03d}: {len(batch)} アカウント / クエリ長 {len(query)}")
 
-    for attempt in range(3):
-        try:
-            response = client.search_recent_tweets(
-                query=query,
-                max_results=MAX_RESULTS_PER_BATCH,
-                since_id=since_id,
-                tweet_fields=["created_at", "author_id", "text", "attachments"],
-                expansions=["attachments.media_keys", "author_id"],
-                media_fields=["url", "preview_image_url", "type"],
-                user_fields=["username"],
-            )
-            return response, None
-        except tweepy.errors.TooManyRequests:
-            wait = RATE_LIMIT_WAIT_SECONDS * (attempt + 1)
-            log.warning(f"  レートリミット超過。{wait}秒後にリトライ（{attempt + 1}/3）")
-            time.sleep(wait)
-        except tweepy.errors.TwitterServerError as e:
-            log.warning(f"  X サーバーエラー: {e}。15秒後にリトライ（{attempt + 1}/3）")
-            time.sleep(15)
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            log.error(f"  予期しないエラー: {err}")
-            return None, err
+    raw_responses: list[dict] = []
+    all_tweets: list[dict] = []
+    media_count = 0
+    pagination_token: str | None = None
+    pages_fetched = 0
 
-    return None, "3回リトライしても失敗"
+    for page in range(1, MAX_PAGES_PER_BATCH + 1):
+        # リトライループ
+        for attempt in range(3):
+            response, err = _call_search(client, query, since_id, pagination_token, include_media)
+            if response is not None:
+                break
+            if err == "TooManyRequests":
+                wait = RATE_LIMIT_WAIT_SECONDS * (attempt + 1)
+                log.warning(f"  rate limit. {wait}秒後にリトライ（{attempt + 1}/3）")
+                time.sleep(wait)
+            else:
+                log.warning(f"  {err}。15秒後にリトライ（{attempt + 1}/3）")
+                time.sleep(15)
+        else:
+            return raw_responses, all_tweets, media_count, f"3回リトライしても失敗（page {page}）"
+
+        pages_fetched += 1
+        raw_responses.append(serialize_response(response))
+
+        page_tweets = parse_tweets(response, user_id_to_username, include_media=include_media)
+        all_tweets.extend(page_tweets)
+        if include_media:
+            media_count += sum(len(t.get("media", [])) for t in page_tweets)
+
+        # 次ページがあるか
+        next_token = response.meta.get("next_token") if response.meta else None
+        if not next_token:
+            break
+        pagination_token = next_token
+        time.sleep(0.5)
+    else:
+        log.warning(f"  バッチ {batch_index:03d}: 最大ページ数({MAX_PAGES_PER_BATCH})に到達。残りはスキップ")
+
+    log.info(f"  バッチ {batch_index:03d}: {len(all_tweets)} 件取得（{pages_fetched} ページ）")
+    return raw_responses, all_tweets, media_count, None
 
 
 # ===========================================================================
@@ -280,6 +474,9 @@ def run(
         sys.exit(1)
 
     raw_data = json.loads(accounts_path.read_text(encoding="utf-8"))
+    settings = raw_data.get("settings", {}) or {}
+    include_media = bool(settings.get("include_media", True))
+
     all_accounts = normalize_accounts(raw_data.get("accounts", []))
     if not all_accounts:
         log.error("accounts.json に有効なアカウントが1件もありません。")
@@ -293,20 +490,21 @@ def run(
     usernames = [a["username"] for a in accounts]
     log.info(
         f"監視アカウント: {len(usernames)} 件 "
-        f"(全 {len(all_accounts)} 件中 / 優先度フィルタ: {priority_filter or 'なし'})"
+        f"(全 {len(all_accounts)} 件中 / 優先度フィルタ: {priority_filter or 'なし'} / "
+        f"media: {'ON' if include_media else 'OFF'})"
     )
 
     # ----- バッチ分割 -----
     batches = split_into_batches(usernames)
     max_batch_size = max(len(b) for b in batches)
     log.info(
-        f"バッチ数: {len(batches)} 個（1バッチあたり最大 {max_batch_size} アカウント）"
+        f"バッチ数: {len(batches)} 個（1バッチ最大 {max_batch_size} アカウント）"
     )
-    log.info(f"1日2回実行時の推定リクエスト数: {len(batches) * 2} 件/日")
+    log.info(f"1日2回実行時の推定リクエスト数: 最低 {len(batches) * 2} 件/日（ページネーション分は加算）")
 
     # ----- dry-run はここで終了 -----
     if dry_run:
-        log.info("[dry-run] API は呼びません。バッチ構造の確認のみ行いました。")
+        log.info("[dry-run] API は呼びません。バッチ構造の確認のみ。")
         for i, batch in enumerate(batches, 1):
             query = build_query(batch)
             log.info(f"  バッチ {i:03d}: {len(batch)} アカウント / クエリ長 {len(query)} 文字")
@@ -318,6 +516,11 @@ def run(
 
     # ----- 本番実行 -----
     client = get_client()
+
+    # ユーザーキャッシュを更新（不足分を取得）
+    user_cache, new_user_lookups = ensure_users_cached(client, usernames)
+    user_id_to_username = {uid: uname for uname, uid in user_cache.items()}
+
     since_ids = load_since_ids()
     new_since_ids: dict[str, str] = {}
 
@@ -330,6 +533,7 @@ def run(
     by_account_dir.mkdir(parents=True, exist_ok=True)
 
     total_tweets   = 0
+    total_media    = 0
     failed_batches = 0
     batch_records: list[dict] = []
     by_account_buffer: dict[str, list[dict]] = {}
@@ -338,60 +542,73 @@ def run(
         batch_key = f"batch_{i:03d}"
         since_id = since_ids.get(batch_key)
 
-        response, err = fetch_batch(client, batch, i, since_id)
+        raw_responses, tweets, media_count, err = fetch_batch_with_pagination(
+            client, batch, i, since_id,
+            include_media=include_media,
+            user_id_to_username=user_id_to_username,
+        )
 
-        if err is not None:
-            failed_batches += 1
-            batch_records.append({
-                "index":       i,
-                "accounts":    batch,
-                "status":      "failed",
-                "error":       err,
-                "tweet_count": 0,
+        # 「投稿取得に成功したものは raw として残る」要件のため、
+        # エラーが出ても、それまでに取得できた raw / tweets は必ず保存する。
+        raw_path: Path | None = None
+        tweets_path: Path | None = None
+        if raw_responses:
+            raw_path = raw_dir / f"{batch_key}.json"
+            atomic_write_json(raw_path, {
+                "fetched_at":    run_start.isoformat(),
+                "batch_index":   i,
+                "accounts":      batch,
+                "page_count":    len(raw_responses),
+                "raw_responses": raw_responses,
             })
-            time.sleep(1)
-            continue
 
-        # ---- raw 保存（API レスポンスをほぼそのまま）----
-        raw = serialize_response(response)
-        raw_path = raw_dir / f"{batch_key}.json"
-        atomic_write_json(raw_path, {
-            "fetched_at":   run_start.isoformat(),
-            "batch_index":  i,
-            "accounts":     batch,
-            "raw_response": raw,
-        })
+            tweets_path = tweets_dir / f"{batch_key}.json"
+            atomic_write_json(tweets_path, {
+                "fetched_at":  run_start.isoformat(),
+                "batch_index": i,
+                "accounts":    batch,
+                "tweet_count": len(tweets),
+                "page_count":  len(raw_responses),
+                "tweets":      tweets,
+            })
 
-        # ---- 加工版保存（後段が使いやすい形）----
-        tweets = parse_tweets(response)
-        tweets_path = tweets_dir / f"{batch_key}.json"
-        atomic_write_json(tweets_path, {
-            "fetched_at":  run_start.isoformat(),
-            "batch_index": i,
-            "accounts":    batch,
-            "tweet_count": len(tweets),
-            "tweets":      tweets,
-        })
+            for tw in tweets:
+                by_account_buffer.setdefault(tw["username"], []).append(tw)
 
-        # ---- アカウント別バッファに振り分け ----
-        for tw in tweets:
-            by_account_buffer.setdefault(tw["username"], []).append(tw)
+            first_meta = raw_responses[0].get("meta") or {}
+            newest_id = first_meta.get("newest_id")
+            if newest_id:
+                new_since_ids[batch_key] = str(newest_id)
 
-        # ---- since_id 更新 ----
-        if response.meta and response.meta.get("newest_id"):
-            new_since_ids[batch_key] = str(response.meta["newest_id"])
+            total_tweets += len(tweets)
+            total_media  += media_count
 
-        total_tweets += len(tweets)
-        batch_records.append({
+        # ステータス判定: 完全成功 / 部分成功（一部ページ失敗） / 完全失敗
+        if err is None:
+            status = "ok"
+        elif raw_responses:
+            status = "partial"
+            failed_batches += 1
+        else:
+            status = "failed"
+            failed_batches += 1
+
+        record = {
             "index":       i,
             "accounts":    batch,
-            "status":      "ok",
+            "status":      status,
             "tweet_count": len(tweets),
-            "raw_path":    str(raw_path.relative_to(run_dir)),
-            "tweets_path": str(tweets_path.relative_to(run_dir)),
-        })
+            "media_count": media_count,
+            "page_count":  len(raw_responses),
+        }
+        if err is not None:
+            record["error"] = err
+        if raw_path is not None:
+            record["raw_path"] = str(raw_path.relative_to(run_dir))
+        if tweets_path is not None:
+            record["tweets_path"] = str(tweets_path.relative_to(run_dir))
+        batch_records.append(record)
 
-        log.info(f"  バッチ {i:03d}: {len(tweets)} 件取得")
         time.sleep(1)
 
     # ----- アカウント別ファイル書き出し -----
@@ -409,19 +626,29 @@ def run(
             "path":  str(path.relative_to(run_dir)),
         }
 
-    # ----- since_ids 更新（成功分のみ）-----
+    # ----- since_ids 更新 -----
     since_ids.update(new_since_ids)
     save_since_ids(since_ids)
+
+    # ----- コスト推定 -----
+    cost = estimate_cost_usd(
+        post_reads=total_tweets,
+        user_reads=new_user_lookups,
+        media_reads=total_media,
+    )
 
     # ----- マニフェスト書き出し -----
     manifest = {
         "run_at":          run_start.isoformat(),
         "priority_filter": priority_filter,
+        "include_media":   include_media,
         "account_count":   len(accounts),
         "batch_count":     len(batches),
         "failed_batches":  failed_batches,
         "total_tweets":    total_tweets,
+        "total_media":     total_media,
         "elapsed_seconds": round((datetime.now() - run_start).total_seconds(), 1),
+        "estimated_cost":  cost,
         "by_account":      by_account_index,
         "batches":         batch_records,
     }
@@ -431,6 +658,7 @@ def run(
         f"=== 完了 === 取得 {total_tweets} 件 / "
         f"アカウント {len(by_account_index)} 件 / "
         f"失敗バッチ {failed_batches} / "
+        f"推定課金額 ${cost['total_usd']} / "
         f"経過 {manifest['elapsed_seconds']}秒"
     )
 

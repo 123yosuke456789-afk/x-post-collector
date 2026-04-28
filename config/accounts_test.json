@@ -1,0 +1,11 @@
+{
+  "_comment": "ライブテスト用：少数アカウントで動作検証する",
+  "settings": {
+    "include_media": false
+  },
+  "accounts": [
+    {"username": "nhk_news",    "priority": "high"},
+    {"username": "Reuters",     "priority": "normal"},
+    {"username": "weathernews", "priority": "normal"}
+  ]
+}

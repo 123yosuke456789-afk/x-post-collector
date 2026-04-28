@@ -9,9 +9,13 @@ from pathlib import Path
 import pytest
 
 from collector import (
+    COST_PER_MEDIA_READ,
+    COST_PER_POST_READ,
+    COST_PER_USER_READ,
     MAX_QUERY_LENGTH,
     atomic_write_json,
     build_query,
+    estimate_cost_usd,
     filter_by_priority,
     normalize_accounts,
     split_into_batches,
@@ -227,6 +231,53 @@ class TestAtomicWriteJson:
         atomic_write_json(target, {"version": 1})
         atomic_write_json(target, {"version": 2})
         assert json.loads(target.read_text()) == {"version": 2}
+
+
+# ===========================================================================
+# estimate_cost_usd
+# ===========================================================================
+
+class TestEstimateCostUsd:
+    def test_zero(self):
+        result = estimate_cost_usd(0, 0, 0)
+        assert result["total_usd"] == 0.0
+        assert result["posts_usd"] == 0.0
+        assert result["users_usd"] == 0.0
+        assert result["media_usd"] == 0.0
+
+    def test_only_posts(self):
+        result = estimate_cost_usd(post_reads=1000, user_reads=0, media_reads=0)
+        assert result["posts_usd"] == 1000 * COST_PER_POST_READ
+        assert result["total_usd"] == 1000 * COST_PER_POST_READ
+
+    def test_only_users(self):
+        result = estimate_cost_usd(post_reads=0, user_reads=100, media_reads=0)
+        assert result["users_usd"] == 100 * COST_PER_USER_READ
+
+    def test_only_media(self):
+        result = estimate_cost_usd(post_reads=0, user_reads=0, media_reads=500)
+        assert result["media_usd"] == 500 * COST_PER_MEDIA_READ
+
+    def test_combination(self):
+        """1000ポスト + 100ユーザー + 500メディア = 5 + 1 + 2.5 = $8.50"""
+        result = estimate_cost_usd(post_reads=1000, user_reads=100, media_reads=500)
+        assert result["total_usd"] == 8.5
+
+    def test_counts_preserved(self):
+        """入力件数も結果に含まれる（manifestに記録するため）。"""
+        result = estimate_cost_usd(post_reads=42, user_reads=7, media_reads=13)
+        assert result["post_reads"] == 42
+        assert result["user_reads"] == 7
+        assert result["media_reads"] == 13
+
+    def test_realistic_1000_accounts_daily(self):
+        """1000アカウント・1日2回・平均5投稿のケース：おおよそ $25/日。"""
+        result = estimate_cost_usd(
+            post_reads=5000,    # 5投稿 × 1000アカウント
+            user_reads=0,       # キャッシュ済み
+            media_reads=0,      # メディアOFF
+        )
+        assert 24.9 <= result["total_usd"] <= 25.1
 
 
 # ===========================================================================

@@ -1,5 +1,8 @@
 {
-  "_comment": "監視対象アカウントの設定ファイル。priority は high / normal / low のいずれか。文字列だけ書いた場合は normal 扱いになる（後方互換）。",
+  "_comment": "監視対象アカウントの設定ファイル。settings.include_media を false にするとメディア取得を停止してコスト削減。priority は high / normal / low（文字列のみ書いた場合は normal 扱い）。",
+  "settings": {
+    "include_media": false
+  },
   "accounts": [
     {"username": "nhk_news",       "priority": "high"},
     {"username": "Reuters",        "priority": "high"},
