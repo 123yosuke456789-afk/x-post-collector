@@ -9,7 +9,7 @@ X（旧Twitter）の指定したアカウント群の最新ポストを、決ま
 **動作環境**
 
 - 動作確認済み：macOS 14（Apple Silicon） / Linux（GitHub Actions の CI） / Python 3.11+3.12
-- Windows での動作確認は行っていません。コア処理（`collector.py` / `status.py`）は純 Python 実装ですので、Windows でのご利用予定があれば事前にお声がけください
+- Windows は当方で実機確認はしていませんが、コアは純 Python のため OS 起因で動かない設計にはしていません。Windows 本番運用の場合は、事前にご相談ください（検証・手順のすり合わせが可能です）
 
 ---
 
