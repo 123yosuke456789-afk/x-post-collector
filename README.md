@@ -6,9 +6,10 @@
 
 X（旧Twitter）の指定したアカウント群の最新ポストを、決まった時間に自動で取得して JSON ファイルに保存するツールです。約1000アカウント・1日2回の定期取得を想定し、**API 利用料金を可能な限り抑える設計** にしてあります。
 
-**動作確認済み環境**: macOS 14（Apple Silicon） / Linux（GitHub Actions の CI）／ Python 3.11 + 3.12
+**動作環境**
 
-> **Windows について**：本ツールは Linux サーバ（cron 想定）または macOS でのご利用を想定しており、Windows ネイティブ環境はサポート対象外です。コア処理（`collector.py` / `status.py`）は標準ライブラリと tweepy のみで構成されているため理論上は Windows でも動作可能ですが、実機での動作検証は行っていません。Windows でのご利用を予定されている場合は事前にご相談ください。
+- 動作確認済み：macOS 14（Apple Silicon） / Linux（GitHub Actions の CI） / Python 3.11+3.12
+- Windows での動作確認は行っていません。コア処理（`collector.py` / `status.py`）は純 Python 実装ですので、Windows でのご利用予定があれば事前にお声がけください
 
 ---
 
