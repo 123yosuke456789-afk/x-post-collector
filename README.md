@@ -1,5 +1,9 @@
 # X Post Collector
 
+[![tests](https://github.com/123yosuke456789-afk/x-post-collector/actions/workflows/tests.yml/badge.svg)](https://github.com/123yosuke456789-afk/x-post-collector/actions/workflows/tests.yml)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 X（旧Twitter）で指定したアカウント群の最新ポストを **X API v2 の Search Recent Tweets** 経由で定期取得・保存する Python ツール。長期運用と API コスト最小化を重視した設計。
 
 **動作確認済み環境**: macOS 14以上 / Python 3.11以上
@@ -68,23 +72,49 @@ flowchart TD
 
 ## クイックスタート
 
+シェルスクリプト 3本で完結します（Python に詳しくない方向け）：
+
 ```bash
 git clone https://github.com/123yosuke456789-afk/x-post-collector.git
 cd x-post-collector
+
+bash setup.sh          # venv 作成 + パッケージインストール + .env 雛形作成
+# .env を開いて X_BEARER_TOKEN を貼る
+bash run.sh --dry-run  # API を呼ばずに構造を確認
+bash run.sh            # 本番実行
+bash status.sh         # 直近の取得状況を人間向けに表示
+```
+
+`status.sh` の出力例：
+
+```
+📋 ユーザーキャッシュ: 1000 件
+📍 since_id: 30 バッチ分を記録済み
+
+📅 本日（2026-04-28）の実行: 2 回
+   ✅ run_06-00-12: 1284 件取得 / 失敗 0 バッチ / 課金 $1.42 (約213円) / 92.4秒
+   ✅ run_18-00-08: 967 件取得 / 失敗 0 バッチ / 課金 $1.10 (約165円) / 78.1秒
+
+📊 過去3日の最新実行:
+   2026-04-28: 最新ラン run_18-00-08 → 967 件 / 課金 $1.10 (約165円)
+   2026-04-27: 最新ラン run_18-00-04 → 1102 件 / 課金 $1.28 (約192円)
+   2026-04-26: 最新ラン run_18-00-09 → 1345 件 / 課金 $1.51 (約227円)
+```
+
+<details>
+<summary>Python コマンドを直接使いたい場合</summary>
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env  # X_BEARER_TOKEN を編集
 
-# Bearer Token を設定
-cp .env.example .env
-# .env を編集して X_BEARER_TOKEN を貼る
-
-# まず dry-run で構造を確認
 python collector.py --dry-run
-
-# 実際に取得
 python collector.py
 ```
+
+</details>
 
 ---
 
@@ -126,17 +156,21 @@ X_BEARER_TOKEN=AAAAAAAAAAAA...
 
 ## 使い方
 
+`run.sh` 経由（推奨）：
+
 ```bash
-# 全アカウント取得
+bash run.sh                                  # 全アカウント取得
+bash run.sh --priority high                  # 高優先度だけ取得
+bash run.sh --accounts config/accounts_test.json  # 設定ファイル指定
+bash run.sh --dry-run                        # API を呼ばずに動作確認
+```
+
+Python 直接実行：
+
+```bash
 python collector.py
-
-# 高優先度だけ取得（cron で頻度を上げる用）
 python collector.py --priority high
-
-# 別の設定ファイルを指定
 python collector.py --accounts config/accounts_test.json
-
-# API を呼ばずに動作確認
 python collector.py --dry-run
 ```
 
@@ -374,6 +408,8 @@ pytest tests/test_batch.py -v
 ```
 
 純粋関数（バッチ分割、アカウント正規化、優先度フィルタ、コスト計算、アトミック書き込み）に対する 37 件のテストを収録。1000・1500件スケールでの動作も検証済み。
+
+GitHub Actions で push / PR ごとに Python 3.11 と 3.12 の両方でテストを自動実行しています（README 上部の `tests` バッジ参照）。
 
 ```
 --- 1000アカウントスケールレポート ---
