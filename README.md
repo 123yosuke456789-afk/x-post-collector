@@ -84,23 +84,23 @@ bash status.sh         # 取得結果を見やすく表示
 
 ## 動くとどうなるか（実行例）
 
-`bash status.sh` を実行すると、こんな出力が出ます：
+`bash status.sh` を実行すると、現在のキャッシュ状況・本日の実行履歴・課金額が一目で分かります。以下は実際の出力例（少数アカウントでのライブテスト時）：
 
 ```
-📋 ユーザーキャッシュ: 1000 件
-📍 since_id: 30 バッチ分を記録済み
+📋 ユーザーキャッシュ: 3 件
+📍 since_id: 0 バッチ分を記録済み
 
 📅 本日（2026-04-28）の実行: 2 回
-   ✅ run_06-00-12: 1284 件取得 / 失敗 0 バッチ / 課金 $1.42 (約213円) / 92.4秒
-   ✅ run_18-00-08: 967 件取得 / 失敗 0 バッチ / 課金 $1.10 (約165円) / 78.1秒
+   ✅ run_10-28-05: 100 件取得 / 失敗 0 バッチ / 課金 $0.00 (約0円) / 1.8秒
+   ⚠️  run_10-43-03: 0 件取得 / 失敗 1 バッチ / 課金 $0.03 (約4円) / 50.3秒
 
 📊 過去3日の最新実行:
-   2026-04-28: 最新ラン run_18-00-08 → 967 件 / 課金 $1.10 (約165円)
-   2026-04-27: 最新ラン run_18-00-04 → 1102 件 / 課金 $1.28 (約192円)
-   2026-04-26: 最新ラン run_18-00-09 → 1345 件 / 課金 $1.51 (約227円)
+   2026-04-28: 最新ラン run_10-43-03 → 0 件 / 課金 $0.03 (約4円)
 ```
 
-「いつ何件取れたか」「いくら課金されたか」が一目で分かります。
+「いつ何件取れたか」「いくら課金されたか」が一目で分かります。`⚠️` のついたランは部分失敗のあった実行で、エラー詳細は `manifest.json` に記録されます（途中まで取得できた raw データは保存済み）。
+
+> **ライブテストの状況**：本ツールは少数アカウント（3件）でのライブ動作確認まで完了しています。1000アカウントスケールは、X API の月次課金上限到達中（2026-05-16 リセット予定）のため、`pytest`（47件・1000/1500件スケール検証含む）と `--dry-run` モードでの検証としています。
 
 ---
 
@@ -172,6 +172,20 @@ bash run.sh --accounts config/accounts_test.json  # 別の設定ファイルを�
 bash run.sh --dry-run                             # API を呼ばずに動作確認
 ```
 
+#### `--dry-run` の実行例（API を呼ばずバッチ構造だけ確認）
+
+```
+=== X Post Collector 開始 [dry-run] ===
+監視アカウント: 20 件 (全 20 件中 / 優先度フィルタ: なし / media: OFF)
+バッチ数: 1 個（1バッチ最大 20 アカウント）
+1日2回実行時の推定リクエスト数: 最低 2 件/日（ページネーション分は加算）
+[dry-run] API は呼びません。バッチ構造の確認のみ。
+  バッチ 001: 20 アカウント / クエリ長 400 文字
+[dry-run] 完了。本番実行時の保存先: data/2026-04-28/run_16-23-08/
+```
+
+設定変更後の動作確認や、本番実行前のバッチ構造プレビューに使えます。**コストは発生しません**。
+
 ### 推奨される運用パターン
 
 優先度別に定期実行を3つ並べると、コストを抑えながら重要アカウントだけ高頻度に追えます：
@@ -218,45 +232,95 @@ data/
 
 ### `manifest.json`（実行サマリ）の例
 
+以下は **1000アカウント運用時の想定例**（フィールドは実装が出力する形式に揃えてあります）：
+
 ```json
 {
   "run_at": "2026-04-28T08:00:00",
+  "priority_filter": null,
   "include_media": false,
   "account_count": 1000,
   "batch_count": 36,
   "failed_batches": 0,
   "total_tweets": 5142,
+  "total_media": 0,
   "elapsed_seconds": 95.3,
   "estimated_cost": {
     "post_reads": 5142,
     "user_reads": 0,
     "media_reads": 0,
+    "posts_usd": 25.71,
+    "users_usd": 0.0,
+    "media_usd": 0.0,
     "total_usd": 25.71
   },
   "by_account": {
     "nhk_news": {"count": 18, "path": "by_account/nhk_news.json"}
   },
   "batches": [
-    {"index": 1, "status": "ok", "tweet_count": 145, "page_count": 2,
-     "raw_path": "raw/batch_001.json", "tweets_path": "tweets/batch_001.json"}
+    {
+      "index": 1,
+      "accounts": ["nhk_news", "Reuters", "..."],
+      "status": "ok",
+      "tweet_count": 145,
+      "page_count": 2,
+      "raw_path": "raw/batch_001.json",
+      "tweets_path": "tweets/batch_001.json"
+    }
   ]
 }
 ```
+
+#### 実物の出力例（部分失敗時の障害解析イメージ）
+
+少数アカウント（3件）のライブテストで意図的にリトライ上限を踏んだランの実物 manifest（抜粋）：
+
+```json
+{
+  "run_at": "2026-04-28T10:43:03.516375",
+  "priority_filter": null,
+  "include_media": false,
+  "account_count": 3,
+  "batch_count": 1,
+  "failed_batches": 1,
+  "total_tweets": 0,
+  "elapsed_seconds": 50.3,
+  "estimated_cost": {
+    "user_reads": 3,
+    "users_usd": 0.03,
+    "total_usd": 0.03
+  },
+  "batches": [
+    {
+      "index": 1,
+      "accounts": ["nhk_news", "Reuters", "weathernews"],
+      "status": "failed",
+      "error": "3回リトライしても失敗（page 3）",
+      "tweet_count": 200,
+      "pages": 2
+    }
+  ]
+}
+```
+
+`status: "failed"` でも、**取得済みの200件は raw / tweets として保存され**、`estimated_cost` には実発生分（ユーザー情報取得3件 = $0.03）だけが計上されます。エラー原因も `batches[].error` に残るため、運用時の障害解析がしやすい構造です。これが依頼仕様「**取得済みデータが失われにくい**」「**ログ確認**」への直接的な実装証拠になります。
 
 ### `manifest.json` の主なフィールド
 
 | 項目 | 意味 |
 |---|---|
 | 実行時刻（`run_at`） | この実行を開始したタイムスタンプ |
+| 優先度フィルタ（`priority_filter`） | 実行時の `--priority` 指定（指定なしは `null`） |
 | メディア取得設定（`include_media`） | この実行でメディアを取得したか（`true`/`false`） |
 | 監視アカウント数（`account_count`） | この実行で対象としたアカウント数 |
 | バッチ数（`batch_count`） | OR クエリで分割したバッチ数 |
 | 失敗バッチ数（`failed_batches`） | エラーで完了しなかったバッチ数 |
 | 取得ポスト総数（`total_tweets`） | この実行で取得したポスト件数 |
+| 取得メディア総数（`total_media`） | この実行で取得したメディア件数 |
 | 所要時間（`elapsed_seconds`） | 実行にかかった秒数 |
-| 推定課金額（`estimated_cost.total_usd`） | この実行で発生したと推定される料金（USD） |
+| 推定課金額（`estimated_cost.total_usd`） | この実行で発生したと推定される料金（USD・内訳付き） |
 | アカウント別件数（`by_account`） | アカウントごとの取得件数とファイルパス |
-| バッチごとの結果（`batches`） | 各バッチの状態・件数・保存パスの配列 |
+| バッチごとの結果（`batches`） | 各バッチの状態・件数・保存パス・エラー詳細の配列 |
 
 各バッチのステータスは3種類：
 
