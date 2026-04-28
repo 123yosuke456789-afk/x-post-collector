@@ -616,6 +616,10 @@ pytest tests/test_batch.py -v
 
 GitHub Actions で push / PR ごとに **Python 3.11 と 3.12 の両方で自動テスト** を実行しています（README 上部の `tests` バッジが現在の状態を示します）。
 
+過去の実行履歴も常に緑（実行全体で平均20秒程度・テスト本体は 0.13 秒で47件全パス）：
+
+![tests workflow history](docs/screenshots/github-actions-history.png)
+
 ```
 --- 1000アカウントスケールレポート ---
 アカウント数      : 1000
