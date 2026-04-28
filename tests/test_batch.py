@@ -17,6 +17,7 @@ from collector import (
     build_query,
     estimate_cost_usd,
     filter_by_priority,
+    make_since_id_key,
     normalize_accounts,
     split_into_batches,
 )
@@ -164,6 +165,83 @@ class TestNormalizeAccounts:
     def test_dict_without_priority_defaults_to_normal(self):
         result = normalize_accounts([{"username": "nhk_news"}])
         assert result == [{"username": "nhk_news", "priority": "normal"}]
+
+    def test_strips_leading_at_sign_string(self):
+        """文字列形式で @ を付けても除去される。"""
+        result = normalize_accounts(["@nhk_news", "@@reuters"])
+        assert result == [
+            {"username": "nhk_news", "priority": "normal"},
+            {"username": "reuters",  "priority": "normal"},
+        ]
+
+    def test_strips_leading_at_sign_dict(self):
+        """dict 形式で @ を付けても除去される。"""
+        result = normalize_accounts([{"username": "@nhk_news", "priority": "high"}])
+        assert result == [{"username": "nhk_news", "priority": "high"}]
+
+    def test_lowercases_username_string(self):
+        """文字列形式で大文字を含んでも小文字化される。"""
+        result = normalize_accounts(["NHK_News", "Reuters"])
+        assert result == [
+            {"username": "nhk_news", "priority": "normal"},
+            {"username": "reuters",  "priority": "normal"},
+        ]
+
+    def test_lowercases_username_dict(self):
+        """dict 形式で大文字を含んでも小文字化される。"""
+        result = normalize_accounts([{"username": "NHK_News", "priority": "high"}])
+        assert result == [{"username": "nhk_news", "priority": "high"}]
+
+    def test_combined_at_and_uppercase(self):
+        """@ 付き + 大文字の組み合わせも正しく正規化される。"""
+        result = normalize_accounts(["@NHK_News", {"username": "@Reuters", "priority": "low"}])
+        assert result == [
+            {"username": "nhk_news", "priority": "normal"},
+            {"username": "reuters",  "priority": "low"},
+        ]
+
+    def test_at_only_skipped(self):
+        """@ だけの文字列など、正規化後に空になるものはスキップされる。"""
+        result = normalize_accounts(["@", "nhk_news"])
+        assert result == [{"username": "nhk_news", "priority": "normal"}]
+
+
+# ===========================================================================
+# make_since_id_key
+# ===========================================================================
+
+class TestMakeSinceIdKey:
+    def test_no_priority_uses_all_prefix(self):
+        """priority_filter が None のときはキーが 'all_batch_NNN' になる。"""
+        assert make_since_id_key(None, 1) == "all_batch_001"
+        assert make_since_id_key(None, 12) == "all_batch_012"
+
+    def test_with_priority_includes_priority(self):
+        """priority_filter 指定時はキーに priority が含まれる。"""
+        assert make_since_id_key("high", 1) == "high_batch_001"
+        assert make_since_id_key("normal", 5) == "normal_batch_005"
+        assert make_since_id_key("low", 99) == "low_batch_099"
+
+    def test_different_priorities_have_distinct_keys(self):
+        """別 priority で同じ batch_index でも、キーは別物になる。
+
+        これが本ヘルパーの存在理由：高頻度実行（priority=high）と
+        低頻度実行（priority=low）が同じ since_id キーを上書き合戦して
+        取りこぼしを起こさないようにする。
+        """
+        keys = {
+            make_since_id_key(None,     1),
+            make_since_id_key("high",   1),
+            make_since_id_key("normal", 1),
+            make_since_id_key("low",    1),
+        }
+        assert len(keys) == 4
+
+    def test_zero_padding(self):
+        """batch_index は3桁ゼロ埋めでフォーマットされる。"""
+        assert make_since_id_key("high", 1)   == "high_batch_001"
+        assert make_since_id_key("high", 10)  == "high_batch_010"
+        assert make_since_id_key("high", 100) == "high_batch_100"
 
 
 # ===========================================================================

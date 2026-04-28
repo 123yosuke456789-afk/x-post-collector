@@ -75,24 +75,52 @@ log = logging.getLogger(__name__)
 # 純粋関数（副作用なし・テスト容易）
 # ===========================================================================
 
+def _normalize_username(name: str) -> str:
+    """username を正規化する。先頭の @ を除去し、小文字化する。
+
+    X 上で username は大文字小文字を区別しないため、accounts.json に
+    "@NHK_News" / "nhk_news" / "NHK_news" などが混在していても重複扱いされず
+    バッチ・by_account ファイル名で表記揺れが起きないようにする。
+    """
+    return name.lstrip("@").lower()
+
+
 def normalize_accounts(raw_accounts: list) -> list[dict]:
     """
     accounts.json の中身を正規形 [{"username": ..., "priority": ...}, ...] に変換する。
     旧形式（"username" 文字列）も新形式（dict）も受け入れる。
+    username は先頭の @ 除去・小文字化で正規化される。
     """
     normalized = []
     for item in raw_accounts:
         if isinstance(item, str):
-            normalized.append({"username": item, "priority": "normal"})
+            name = _normalize_username(item)
+            if not name:
+                continue
+            normalized.append({"username": name, "priority": "normal"})
         elif isinstance(item, dict):
-            username = item.get("username")
-            if not username:
+            raw_name = item.get("username")
+            if not raw_name:
+                continue
+            name = _normalize_username(raw_name)
+            if not name:
                 continue
             priority = item.get("priority", "normal")
             if priority not in VALID_PRIORITIES:
                 priority = "normal"
-            normalized.append({"username": username, "priority": priority})
+            normalized.append({"username": name, "priority": priority})
     return normalized
+
+
+def make_since_id_key(priority_filter: str | None, batch_index: int) -> str:
+    """since_ids.json 保存用のキーを生成する。
+
+    優先度別の並列実行（high 6h / normal 12h / low 24h など）で
+    別フィルタの since_id が同じキーを上書き合戦しないよう、
+    キーに priority_filter を含める。フィルタなし実行は "all" として扱う。
+    """
+    prefix = priority_filter if priority_filter else "all"
+    return f"{prefix}_batch_{batch_index:03d}"
 
 
 def filter_by_priority(accounts: list[dict], priority_filter: str | None) -> list[dict]:
@@ -539,8 +567,9 @@ def run(
     by_account_buffer: dict[str, list[dict]] = {}
 
     for i, batch in enumerate(batches, 1):
-        batch_key = f"batch_{i:03d}"
-        since_id = since_ids.get(batch_key)
+        batch_filename = f"batch_{i:03d}"
+        since_key = make_since_id_key(priority_filter, i)
+        since_id = since_ids.get(since_key)
 
         raw_responses, tweets, media_count, err = fetch_batch_with_pagination(
             client, batch, i, since_id,
@@ -553,7 +582,7 @@ def run(
         raw_path: Path | None = None
         tweets_path: Path | None = None
         if raw_responses:
-            raw_path = raw_dir / f"{batch_key}.json"
+            raw_path = raw_dir / f"{batch_filename}.json"
             atomic_write_json(raw_path, {
                 "fetched_at":    run_start.isoformat(),
                 "batch_index":   i,
@@ -562,7 +591,7 @@ def run(
                 "raw_responses": raw_responses,
             })
 
-            tweets_path = tweets_dir / f"{batch_key}.json"
+            tweets_path = tweets_dir / f"{batch_filename}.json"
             atomic_write_json(tweets_path, {
                 "fetched_at":  run_start.isoformat(),
                 "batch_index": i,
@@ -578,7 +607,7 @@ def run(
             first_meta = raw_responses[0].get("meta") or {}
             newest_id = first_meta.get("newest_id")
             if newest_id:
-                new_since_ids[batch_key] = str(newest_id)
+                new_since_ids[since_key] = str(newest_id)
 
             total_tweets += len(tweets)
             total_media  += media_count
