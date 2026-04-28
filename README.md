@@ -1,156 +1,410 @@
 # X Post Collector
 
-X（旧Twitter）で指定したアカウント群の最新ポストを定期取得・保存する Python ツール。
+X（旧Twitter）で指定したアカウント群の最新ポストを **X API v2 の Search Recent Tweets** 経由で定期取得・保存する Python ツール。長期運用と API コスト最小化を重視した設計。
 
 **動作確認済み環境**: macOS 14以上 / Python 3.11以上
 
 ---
 
-## 機能
+## 目次
 
-- 設定ファイル（`config/accounts.json`）でアカウントを管理。コード修正なしで追加・削除できる
-- X API v2 の Search API を OR クエリで束ねてリクエスト数を最小化
-- リポスト・リプライを除外し、純粋な新規ポストのみを取得
-- 日付・実行単位でディレクトリを分けた JSON 保存
-- レートリミット時の自動待機・リトライ（最大3回）
-- 前回取得済みの投稿 ID（`since_id`）を記録し、重複取得を防止
-- `--dry-run` で API を呼ばずに動作確認できる
-- 実行ログを日付ごとのファイルに記録
-
----
-
-## 1000アカウント対応の設計
-
-1000アカウントを OR クエリに分割してリクエスト数を最小化している。
-
-| アカウント数 | バッチ数 | 1日2回実行時のリクエスト数 | X API Basic 制限（300件/15分）に対する余裕 |
-|---:|---:|---:|---:|
-| 100 | 4 | 8 | 3000x |
-| 500 | 18 | 36 | 830x |
-| **1000** | **36** | **72** | **400x** |
-
-この分割ロジックは単体テストで検証済み（`pytest tests/test_batch.py`）。
-
-```
---- 1000アカウントスケールレポート ---
-アカウント数     : 1000
-バッチ数         : 36
-最大バッチサイズ  : 30 アカウント
-1日2回実行時     : 72 リクエスト/日
-X API制限（Basic）: 300 リクエスト/15分
-余裕率           : 400x 以上の余裕
-```
+- [主な機能](#主な機能)
+- [アーキテクチャ](#アーキテクチャ)
+- [クイックスタート](#クイックスタート)
+- [設定](#設定)
+- [使い方](#使い方)
+- [保存される構造](#保存される構造)
+- [コスト最適化（重要）](#コスト最適化重要)
+- [設計判断の根拠](#設計判断の根拠)
+- [Search API と List API の比較](#search-api-と-list-api-の比較)
+- [テスト](#テスト)
+- [エラー時の確認方法](#エラー時の確認方法)
+- [定期実行（launchd）](#定期実行launchd)
 
 ---
 
-## インストール
+## 主な機能
+
+- **OR クエリでバッチ化**：1000アカウントを 30〜40件ずつまとめて検索し、リクエスト数を最小化
+- **ページネーション対応**：`next_token` で複数ページを取得し、活発なアカウントでも取りこぼしを防ぐ
+- **ユーザー情報のキャッシュ**：起動時に1回だけまとめて取得して `users_cache.json` に保存。以後の expansion 課金をゼロに
+- **メディア取得 ON/OFF**：設定ファイルだけで切替可能
+- **優先度別フィルタ**：`priority: high/normal/low` で実行頻度を分けられる
+- **アトミック書き込み**：途中で電源が落ちてもファイルが破損しない
+- **raw / 加工版 / アカウント別 / マニフェストの4種保存**：後段システムが扱いやすい構造
+- **`since_id` で重複取得防止**：前回以降の新規ポストだけを取得
+- **コスト見える化**：実行ごとに `manifest.json` に推定課金額を記録
+- **dry-run モード**：API を呼ばずに動作確認できる
+
+---
+
+## アーキテクチャ
+
+```mermaid
+flowchart TD
+    A[accounts.json<br/>監視対象リスト] --> B[collector.py]
+    E[.env<br/>Bearer Token] --> B
+
+    B --> C{ユーザーキャッシュ<br/>あるか?}
+    C -- なし --> D[GET /2/users/by<br/>username→user_id 取得]
+    D --> F[users_cache.json<br/>永続保存]
+    C -- あり --> G
+
+    F --> G[OR クエリでバッチ化<br/>30〜40アカウント/バッチ]
+    G --> H[search_recent_tweets<br/>since_id + next_token ループ]
+    H --> I[raw/batch_NNN.json<br/>API 生レスポンス]
+    H --> J[tweets/batch_NNN.json<br/>整形済み]
+    H --> K[by_account/USERNAME.json<br/>アカウント別ビュー]
+    H --> L[manifest.json<br/>サマリ + 推定課金額]
+    H --> M[since_ids.json<br/>次回開始位置]
+
+    style I fill:#fff3cd
+    style J fill:#d4edda
+    style K fill:#cce5ff
+    style L fill:#f8d7da
+```
+
+---
+
+## クイックスタート
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/x-post-collector.git
+git clone https://github.com/123yosuke456789-afk/x-post-collector.git
 cd x-post-collector
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+# Bearer Token を設定
+cp .env.example .env
+# .env を編集して X_BEARER_TOKEN を貼る
+
+# まず dry-run で構造を確認
+python collector.py --dry-run
+
+# 実際に取得
+python collector.py
 ```
 
 ---
 
 ## 設定
 
-### 1. Bearer Token の設定
+### Bearer Token
 
-```bash
-cp .env.example .env
-# .env を編集して X_BEARER_TOKEN を記入
+[X Developer Console](https://console.x.com) でアプリの「ペアラートークン」を生成し、`.env` に記入する：
+
+```
+X_BEARER_TOKEN=AAAAAAAAAAAA...
 ```
 
-X Developer Console（[console.x.com](https://console.x.com)）でアプリの Bearer Token を生成してください。
-
-### 2. 監視アカウントの設定
-
-`config/accounts.json` を編集する。
+### accounts.json
 
 ```json
 {
+  "settings": {
+    "include_media": false
+  },
   "accounts": [
-    "nhk_news",
-    "mainichi",
-    "yomiuri_online"
+    {"username": "nhk_news",     "priority": "high"},
+    {"username": "Reuters",      "priority": "high"},
+    {"username": "mainichi",     "priority": "normal"},
+    {"username": "yomiuri_online","priority": "normal"},
+    "SoftBank_Corp",
+    "docomo_jp"
   ]
 }
 ```
 
-アカウントの追加・削除はこのファイルだけを変更すればよく、コード修正は不要。
+- **`settings.include_media`**：`true` でメディア（画像・動画URL）取得 ON、`false` で OFF（コスト削減）
+- **`accounts`**：監視対象。`{"username": ..., "priority": ...}` 形式と文字列形式（`priority` 省略 = `normal`）を併用可能
+- **`priority`**：`high` / `normal` / `low`。`--priority high` で絞り込み実行できる
+
+設定変更はこのファイルだけで完結し、コード修正は不要。
 
 ---
 
 ## 使い方
 
 ```bash
-# 通常実行
+# 全アカウント取得
 python collector.py
 
-# 動作確認（API を呼ばない）
+# 高優先度だけ取得（cron で頻度を上げる用）
+python collector.py --priority high
+
+# 別の設定ファイルを指定
+python collector.py --accounts config/accounts_test.json
+
+# API を呼ばずに動作確認
 python collector.py --dry-run
-
-# アカウントファイルを指定
-python collector.py --accounts config/accounts.json
 ```
 
-### dry-run の出力例（1000アカウントの場合）
+### 推奨される運用パターン
+
+優先度別に launchd / cron を3つ並べると、コストを抑えながら重要アカウントだけ高頻度に追える：
+
+| 優先度 | 推奨頻度 | 用途 |
+|---|---|---|
+| `high`   | 6時間ごと（1日4回） | ニュース速報・公式発表 |
+| `normal` | 12時間ごと（1日2回） | 通常のキャッチアップ |
+| `low`    | 24時間ごと（1日1回） | 重要度の低いアカウント |
+
+---
+
+## 保存される構造
 
 ```
-[INFO] === X Post Collector 開始 [dry-run] ===
-[INFO] 監視アカウント数: 1000 件
-[INFO] バッチ数: 36 個（1バッチあたり最大 30 アカウント）
-[INFO] 1日2回実行時の推定リクエスト数: 72 件/日
-[INFO] [dry-run] API は呼び出しません。バッチ構造の確認のみ行います。
-[INFO]   バッチ 001: 30 アカウント / クエリ長 291 文字
-[INFO]   バッチ 002: 30 アカウント / クエリ長 296 文字
-...（36バッチ）
-[INFO] [dry-run] 完了。保存先: data/2026-04-28/run_08-00-00/
+data/
+├── since_ids.json                ← 次回の取得開始位置（バッチごと）
+├── users_cache.json              ← username → user_id の永続キャッシュ
+└── 2026-04-28/                   ← 実行日
+    └── run_08-00-00/             ← 実行時刻
+        ├── manifest.json         ← サマリ + 推定課金額
+        ├── raw/
+        │   ├── batch_001.json    ← API 生レスポンス（後段の再処理用）
+        │   └── batch_002.json
+        ├── tweets/
+        │   ├── batch_001.json    ← 整形済み（すぐ使える形式）
+        │   └── batch_002.json
+        └── by_account/
+            ├── nhk_news.json     ← アカウント別ビュー
+            └── mainichi.json
+```
+
+### manifest.json の例
+
+```json
+{
+  "run_at": "2026-04-28T08:00:00",
+  "include_media": false,
+  "account_count": 1000,
+  "batch_count": 36,
+  "failed_batches": 0,
+  "total_tweets": 5142,
+  "elapsed_seconds": 95.3,
+  "estimated_cost": {
+    "post_reads": 5142,
+    "user_reads": 0,
+    "media_reads": 0,
+    "total_usd": 25.71
+  },
+  "by_account": {
+    "nhk_news": {"count": 18, "path": "by_account/nhk_news.json"}
+  },
+  "batches": [
+    {"index": 1, "status": "ok", "tweet_count": 145, "page_count": 2,
+     "raw_path": "raw/batch_001.json", "tweets_path": "tweets/batch_001.json"}
+  ]
+}
+```
+
+各 batch のステータスは `ok` / `partial`（一部ページで失敗・取得済み分は保存されている） / `failed`（1件も取得できなかった）の3種類。
+
+---
+
+## コスト最適化（重要）
+
+### X API の料金体系（2026年2月以降）
+
+X API は **従量課金制（Pay-Per-Use）** がデフォルトになり、料金は「リクエスト数」ではなく「**取得したリソース数**」で決まります。
+
+| リソース | 単価 |
+|---|---|
+| ポスト1件 | $0.005 |
+| ユーザー情報1件 | $0.010 |
+| メディア1件 | $0.005 |
+| 24時間以内の同一リソース取得 | **無料**（自動 dedup） |
+
+### 1000アカウント運用時のコスト試算（1$=150円）
+
+| 設定 | 月額（参考） |
+|---|---|
+| 何も最適化しない場合 | 約 208,000 円 |
+| ユーザーキャッシュ ON | 約 163,000 円 |
+| ユーザーキャッシュ ON + メディア OFF | **約 112,500 円** |
+| 上記 + 低優先度アカウントを1日1回に | **約 100,000 円** |
+
+平均5投稿/日/アカウント、メディア比率30%、1日2回実行を想定。
+
+### 本ツールが実装しているコスト削減策
+
+| 機能 | 削減効果 |
+|---|---|
+| `since_id` による重複取得防止 | リトライ・再起動時の二重課金を回避 |
+| クエリレベルでリプライ・リポスト除外 | 不要ポストへの課金を回避 |
+| ユーザー情報の事前キャッシュ | 月 約 45,000 円削減 |
+| メディア取得 ON/OFF 切替 | OFF 時 月 約 50,000 円削減 |
+| 優先度別取得頻度（運用提案） | low priority を 1日1回にすれば該当分のコスト半減 |
+
+### 理論的な最低コスト
+
+> **最低コスト = 取得した新着投稿数 × $0.005**
+
+これより下げるには、監視対象を減らすか・取得頻度を下げる必要があります。本ツールは **設定変更だけで両方が可能** です。
+
+### 安全装置
+
+X API 側で **1ヶ月の支払い上限**を Developer Console から設定可能です。本ツールはエラーハンドリング込みで設計されており、上限到達時は `403 Forbidden` を受けて graceful に終了します（取得済みデータは破損しません）。
+
+---
+
+## 設計判断の根拠
+
+各機能を「なぜ」追加したかをまとめます。すべて依頼仕様と直接対応しています。
+
+### Search API（OR クエリ）の採用
+
+- **依頼仕様**：「APIリクエスト回数をできるだけ減らす」「Search APIで複数アカウントをOR検索でまとめる、List APIを活用するなど」
+- **採用案**：Search Recent Tweets を `from:a OR from:b OR ...` で束ねて呼び出す
+- **検討した代替**：List API（後述「Search API と List API の比較」を参照）
+- **決定理由**：設定ファイル1つで監視対象を完結管理でき、X 側のリスト同期処理を持たずに済むため、長期運用での運用負荷が最小
+
+### バッチ自動分割
+
+- **依頼仕様**：「1000アカウント」「APIリクエスト回数を最小化」
+- **発見した制約**：Search API の1クエリあたりの文字数上限は 512 文字。1000アカウントを単一クエリでは送れない
+- **採用案**：480 文字を上限に動的にバッチ分割（1000アカウントで 約36バッチ）
+- **テスト**：`tests/test_batch.py::TestSplitIntoBatches` で 100/500/1000/1500件を検証
+
+### ページネーション対応（next_token）
+
+- **依頼仕様**：「取りこぼしにくい構造」
+- **発見した制約**：1リクエストあたり最大100件のレスポンス。活発アカウント混在で頻繁に上限に達する
+- **採用案**：`next_token` をループで処理（最大10ページの安全弁付き）
+- **検討した代替**：取得頻度を上げて1回あたりの件数を減らす → コスト増、本質解決にならず却下
+
+### `since_id` による重複取得防止
+
+- **依頼仕様**：「APIコストの極小化」
+- **採用案**：バッチごとに最後の `newest_id` を `data/since_ids.json` に保存し、次回はそれ以降のポストだけ取得
+- **追加効果**：途中失敗時のリトライでも二重課金にならない
+
+### リプライ・リポストのクエリ除外
+
+- **依頼仕様**：「リポスト・リプライは除外してノイズを減らしたい」
+- **採用案**：クエリに `-is:retweet -is:reply` を含める（API 側でフィルタされるので **取得していない＝課金されない**）
+- **検討した代替**：取得後にローカルでフィルタ → 課金されてしまうので却下
+
+### ユーザー情報のキャッシュ
+
+- **依頼仕様**：「APIコストの極小化（最重要項目）」
+- **発見した制約**：`expansions=author_id` を使うとユーザー情報1件 $0.010 が課金される（24h dedup あり）
+- **採用案**：起動時に `GET /2/users/by` で 100件ずつまとめて取得し、`data/users_cache.json` に永続保存。以後は expansion を使わず、`author_id` → `username` をキャッシュで解決
+- **削減効果**：1000アカウント運用で月 約 45,000 円
+- **検討した代替**：expansion を毎回使う → 高コスト、却下
+
+### メディア取得 ON/OFF
+
+- **依頼仕様**：「画像などのメディアURL（**あれば**）」＝必須ではない
+- **採用案**：`accounts.json` の `settings.include_media` で切替。`false` なら expansion を使わずメディア課金ゼロ
+- **削減効果**：OFF で月 約 50,000 円
+- **デフォルト**：`true`（依頼文の「あれば」を尊重）。提案時は OFF を推奨
+
+### 優先順位機能
+
+- **依頼仕様**：「優先順位や取得頻度を設定変更で変えられること」
+- **採用案**：`accounts.json` の各アカウントに `priority: high/normal/low` を持たせ、`--priority high` で絞り込み実行。launchd / cron を3つ並べて頻度を分けられる
+- **削減効果**：低優先度アカウントの取得頻度を半減すれば、該当分のコスト半減
+
+### raw / 加工版 / アカウント別 の3層保存
+
+- **依頼仕様**：「rawデータをできるだけそのまま保持」「日付別・アカウント別・処理単位別に追いやすい」「再仕分け・再抽出・再読み込みがしやすい」
+- **採用案**：1回の実行で次の3つを生成する：
+  - `raw/`: API 生レスポンス（再処理の正本）
+  - `tweets/`: 整形済み（すぐ使える）
+  - `by_account/`: アカウント単位の集計
+- **検討した代替**：raw のみ保存し加工は読み出し時に行う → 後段システムの実装コストが増えるため却下
+
+### マニフェストファイル
+
+- **依頼仕様**：「保存は後から別システム側で仕分け・再処理しやすい形式」
+- **採用案**：実行ごとに `manifest.json` を生成。サマリ・各バッチの状態・アカウント別の件数・推定課金額を一覧化
+- **後段システムへの効果**：マニフェスト1ファイルだけ読めばその実行の全容が把握できる
+
+### アトミック書き込み
+
+- **依頼仕様**：「障害や一部失敗時にも、取得済みデータが失われにくい」
+- **採用案**：すべてのファイル書き込みを「temp ファイル → rename」で原子化（POSIX rename はアトミック）
+- **効果**：書き込み中にクラッシュしても本体ファイルは破損しない
+
+### 部分成功時のデータ保持
+
+- **依頼仕様**：「投稿取得に成功したものは、後段の整理処理に失敗しても raw データとして残る構造」
+- **採用案**：ページネーション中の途中エラーでも、それまでに取得済みのページは保存。ステータスを `partial` として記録
+- **検討した代替**：エラー時は全破棄 → 依頼仕様違反のため却下（実際に途中バージョンで一度この動作があったが修正済み）
+
+### コスト見える化
+
+- **依頼仕様**：「APIコストの極小化」を運用後も継続するため
+- **採用案**：実行ごとに `manifest.json` に推定課金額（USD）を記録。後で集計して月額把握ができる
+
+### 推定課金額の単価ハードコーディング
+
+- **採用案**：`COST_PER_POST_READ` などを `collector.py` の冒頭に定数化
+- **検討した代替**：API から動的取得 → そのような API は提供されていない
+- **将来対応**：単価変更時はこの定数を更新するだけ
+
+---
+
+## Search API と List API の比較
+
+依頼仕様には「Search APIで複数アカウントをOR検索でまとめる、**List APIを活用するなど**」と書かれているため、両方を比較検討しました。
+
+| 観点 | Search API（採用） | List API |
+|---|---|---|
+| 仕組み | クエリで複数アカウントを OR 結合し検索 | 事前に X 上にリストを作っておき、そのリストから取得 |
+| アカウント追加・削除 | `accounts.json` を編集するだけ | `accounts.json` を編集 + List API でリストにも反映 |
+| 設定の正本 | `accounts.json` のみ | `accounts.json` + X 上のリスト（同期が必要） |
+| 優先度別フィルタ | クエリで自由に切り替え可能 | 別リストを作る必要あり |
+| 1リクエストあたりの上限 | 100件・クエリ長 512 文字 | 100件・リスト長5000まで |
+| ポスト読取コスト | $0.005 / 件 | $0.005 / 件（同じ） |
+| バッチ処理 | OR クエリで複数アカウントまとめ | 1リスト = 1リクエスト |
+| 運用負荷 | **低**（設定ファイル1本） | 高（同期処理が必要） |
+| コスト差 | ほぼ同じ | ほぼ同じ |
+
+**結論**：コスト差は小さく、**運用の単純さで Search API を採用**。依頼主が最重要視する「**完成後の軽微な変更で毎回開発依頼が必要にならないこと**」に直接応える。
+
+---
+
+## テスト
+
+```bash
+pytest tests/test_batch.py -v
+```
+
+純粋関数（バッチ分割、アカウント正規化、優先度フィルタ、コスト計算、アトミック書き込み）に対する 37 件のテストを収録。1000・1500件スケールでの動作も検証済み。
+
+```
+--- 1000アカウントスケールレポート ---
+アカウント数      : 1000
+バッチ数          : 36
+最大バッチサイズ  : 30 アカウント
+1日2回実行時      : 72 リクエスト/日
 ```
 
 ---
 
-## 保存先の構造
+## エラー時の確認方法
 
-```
-data/
-└── 2026-04-28/
-    └── run_08-00-00/
-        ├── batch_001.json   ← バッチごとの raw データ
-        ├── batch_002.json
-        ├── ...
-        └── summary.json     ← 実行サマリ（取得件数・失敗数・経過時間）
+```bash
+# 当日のログ
+cat logs/2026-04-28.log
+
+# 最新の実行サマリ
+ls -t data/2026-04-28/ | head -1 | xargs -I {} cat data/2026-04-28/{}/manifest.json
 ```
 
-各 `batch_NNN.json` の中身：
+`manifest.json` の `failed_batches` が 0 以外、または各 batch の `status` が `partial` / `failed` の場合：
 
-```json
-{
-  "fetched_at": "2026-04-28T08:00:00",
-  "batch_index": 1,
-  "accounts": ["nhk_news", "mainichi", ...],
-  "tweet_count": 45,
-  "tweets": [
-    {
-      "id": "1234567890",
-      "author_id": "123456",
-      "username": "nhk_news",
-      "text": "...",
-      "created_at": "2026-04-28T07:45:00+00:00",
-      "media": [{"type": "photo", "url": "https://..."}]
-    }
-  ]
-}
-```
+- `partial`：ページネーション途中で失敗。それまでに取得した分は `raw_path` / `tweets_path` に保存済み
+- `failed`：1件も取得できなかった。該当バッチの内容はログで確認
 
 ---
 
 ## 定期実行（launchd）
 
-1日2回（8:00 と 20:00）自動実行する設定例（macOS）:
+1日2回（8:00 と 20:00）の実行例（macOS）：
 
 ```xml
 <!-- ~/Library/LaunchAgents/com.user.x-post-collector.plist -->
@@ -167,24 +421,4 @@ data/
 </array>
 ```
 
----
-
-## テスト実行
-
-```bash
-pytest tests/test_batch.py -v
-```
-
----
-
-## エラー時の確認方法
-
-```bash
-# 当日のログを確認
-cat logs/2026-04-28.log
-
-# 実行サマリを確認
-cat data/2026-04-28/run_08-00-00/summary.json
-```
-
-`summary.json` の `failed_batches` が 0 以外の場合は、ログで該当バッチのエラー内容を確認してください。失敗バッチ以外の取得済みデータは保存されています。
+優先度別に複数の plist を作って頻度を分ければ、低優先度アカウントのコストを削減できます。
