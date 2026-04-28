@@ -8,7 +8,7 @@ X（旧Twitter）の指定したアカウント群の最新ポストを、決ま
 
 **動作確認済み環境**: macOS 14（Apple Silicon） / Linux（GitHub Actions の CI）／ Python 3.11 + 3.12
 
-> **Windows について**：Python 自体は動作しますが、付属のシェルスクリプト（`setup.sh` / `run.sh` / `status.sh`）は bash 前提のため、**Git Bash または WSL（Windows Subsystem for Linux）が必要**です。Windows ネイティブ環境での動作確認は行っていません。
+> **Windows について**：本ツールは Linux サーバ（cron 想定）または macOS でのご利用を想定しており、Windows ネイティブ環境はサポート対象外です。コア処理（`collector.py` / `status.py`）は標準ライブラリと tweepy のみで構成されているため理論上は Windows でも動作可能ですが、実機での動作検証は行っていません。Windows でのご利用を予定されている場合は事前にご相談ください。
 
 ---
 
