@@ -1,13 +1,26 @@
 """
 バッチ分割ロジックの単体テスト。
-
-APIキーなしで実行できる。
-1000アカウントでも正しく動作することをここで証明する。
+APIキーなしで実行できる。1000・1500アカウントでも正しく動作することをここで証明する。
 """
 
-import pytest
-from collector import split_into_batches, build_query, MAX_QUERY_LENGTH
+import json
+from pathlib import Path
 
+import pytest
+
+from collector import (
+    MAX_QUERY_LENGTH,
+    atomic_write_json,
+    build_query,
+    filter_by_priority,
+    normalize_accounts,
+    split_into_batches,
+)
+
+
+# ===========================================================================
+# split_into_batches
+# ===========================================================================
 
 class TestSplitIntoBatches:
     def test_small_list(self):
@@ -32,27 +45,33 @@ class TestSplitIntoBatches:
         assert len(all_accounts) == len(set(all_accounts))
 
     def test_query_length_within_limit(self):
-        """各バッチのクエリ長がMAX_QUERY_LENGTH以内に収まる。"""
+        """各バッチのコアクエリ長が MAX_QUERY_LENGTH 以内に収まる。"""
         accounts = [f"user_{i}" for i in range(1000)]
         batches = split_into_batches(accounts)
         for i, batch in enumerate(batches):
-            # build_query は除外フィルタ (-is:retweet 等) も加えるのでそちらで計算
-            query = build_query(batch)
-            # build_query が追加するフィルタを除いたコア部分がMAX_QUERY_LENGTH以内
             core_query = " OR ".join(f"from:{a}" for a in batch)
             assert len(core_query) <= MAX_QUERY_LENGTH, (
-                f"バッチ {i+1} のコアクエリが {len(core_query)} 文字（上限 {MAX_QUERY_LENGTH}）"
+                f"バッチ {i+1} のクエリが {len(core_query)} 文字（上限 {MAX_QUERY_LENGTH}）"
             )
 
     def test_1000_accounts_batch_count(self):
-        """1000アカウントが適切なバッチ数に分割される（目安: 15〜25バッチ）。"""
+        """1000アカウントが適切なバッチ数に分割される。"""
         accounts = [f"user_{i}" for i in range(1000)]
         batches = split_into_batches(accounts)
-        # 1バッチあたり約25〜60アカウントが入るはず
         assert 15 <= len(batches) <= 50, f"バッチ数: {len(batches)}"
 
+    def test_1500_accounts_scale(self):
+        """1500アカウント（依頼の「約1000」が増加した場合）でも動作する。"""
+        accounts = [f"user_{i}" for i in range(1500)]
+        batches = split_into_batches(accounts)
+        result = [a for batch in batches for a in batch]
+        assert sorted(result) == sorted(accounts)
+        for batch in batches:
+            core_query = " OR ".join(f"from:{a}" for a in batch)
+            assert len(core_query) <= MAX_QUERY_LENGTH
+
     def test_long_usernames(self):
-        """最大15文字のユーザー名でも正しく分割される。"""
+        """X 上限の 15 文字に近いユーザー名でも正しく分割される。"""
         accounts = [f"user_{'x' * 10}_{i}" for i in range(500)]
         batches = split_into_batches(accounts)
         result = [a for batch in batches for a in batch]
@@ -62,56 +81,184 @@ class TestSplitIntoBatches:
             assert len(core_query) <= MAX_QUERY_LENGTH
 
     def test_single_account(self):
-        """アカウント1件でも動く。"""
         batches = split_into_batches(["nhk_news"])
         assert len(batches) == 1
         assert batches[0] == ["nhk_news"]
 
     def test_empty_list(self):
-        """空リストは空のバッチリストを返す。"""
-        batches = split_into_batches([])
-        assert batches == []
+        assert split_into_batches([]) == []
 
+
+# ===========================================================================
+# build_query
+# ===========================================================================
 
 class TestBuildQuery:
     def test_retweet_excluded(self):
-        """-is:retweet が含まれる。"""
-        query = build_query(["nhk_news", "mainichi"])
-        assert "-is:retweet" in query
+        assert "-is:retweet" in build_query(["nhk_news", "mainichi"])
 
     def test_reply_excluded(self):
-        """-is:reply が含まれる。"""
-        query = build_query(["nhk_news", "mainichi"])
-        assert "-is:reply" in query
+        assert "-is:reply" in build_query(["nhk_news", "mainichi"])
 
     def test_from_clause(self):
-        """from:username が含まれる。"""
         query = build_query(["nhk_news", "mainichi"])
         assert "from:nhk_news" in query
         assert "from:mainichi" in query
 
     def test_or_operator(self):
-        """複数アカウントが OR で結合される。"""
-        query = build_query(["a", "b", "c"])
-        assert "OR" in query
+        assert "OR" in build_query(["a", "b", "c"])
 
+
+# ===========================================================================
+# normalize_accounts
+# ===========================================================================
+
+class TestNormalizeAccounts:
+    def test_string_format(self):
+        """旧形式（文字列）は priority normal に変換される。"""
+        result = normalize_accounts(["nhk_news", "mainichi"])
+        assert result == [
+            {"username": "nhk_news", "priority": "normal"},
+            {"username": "mainichi", "priority": "normal"},
+        ]
+
+    def test_dict_format(self):
+        """新形式（dict）はそのまま正規化される。"""
+        result = normalize_accounts([
+            {"username": "nhk_news", "priority": "high"},
+            {"username": "mainichi", "priority": "low"},
+        ])
+        assert result == [
+            {"username": "nhk_news", "priority": "high"},
+            {"username": "mainichi", "priority": "low"},
+        ]
+
+    def test_mixed_format(self):
+        """文字列と dict が混在しても正しく処理される。"""
+        result = normalize_accounts([
+            {"username": "nhk_news", "priority": "high"},
+            "mainichi",
+        ])
+        assert result == [
+            {"username": "nhk_news", "priority": "high"},
+            {"username": "mainichi", "priority": "normal"},
+        ]
+
+    def test_invalid_priority_falls_back(self):
+        """無効な priority は normal に戻される。"""
+        result = normalize_accounts([{"username": "nhk_news", "priority": "urgent"}])
+        assert result == [{"username": "nhk_news", "priority": "normal"}]
+
+    def test_missing_username_skipped(self):
+        """username がない要素はスキップされる。"""
+        result = normalize_accounts([
+            {"username": "nhk_news", "priority": "high"},
+            {"priority": "high"},
+        ])
+        assert result == [{"username": "nhk_news", "priority": "high"}]
+
+    def test_dict_without_priority_defaults_to_normal(self):
+        result = normalize_accounts([{"username": "nhk_news"}])
+        assert result == [{"username": "nhk_news", "priority": "normal"}]
+
+
+# ===========================================================================
+# filter_by_priority
+# ===========================================================================
+
+class TestFilterByPriority:
+    @pytest.fixture
+    def accounts(self):
+        return [
+            {"username": "a", "priority": "high"},
+            {"username": "b", "priority": "high"},
+            {"username": "c", "priority": "normal"},
+            {"username": "d", "priority": "low"},
+        ]
+
+    def test_no_filter_returns_all(self, accounts):
+        assert filter_by_priority(accounts, None) == accounts
+
+    def test_high_filter(self, accounts):
+        result = filter_by_priority(accounts, "high")
+        assert [a["username"] for a in result] == ["a", "b"]
+
+    def test_normal_filter(self, accounts):
+        result = filter_by_priority(accounts, "normal")
+        assert [a["username"] for a in result] == ["c"]
+
+    def test_low_filter(self, accounts):
+        result = filter_by_priority(accounts, "low")
+        assert [a["username"] for a in result] == ["d"]
+
+    def test_no_match_returns_empty(self, accounts):
+        result = filter_by_priority(
+            [{"username": "x", "priority": "normal"}], "high"
+        )
+        assert result == []
+
+
+# ===========================================================================
+# atomic_write_json
+# ===========================================================================
+
+class TestAtomicWriteJson:
+    def test_writes_correctly(self, tmp_path: Path):
+        target = tmp_path / "test.json"
+        atomic_write_json(target, {"key": "value", "n": 42})
+        assert json.loads(target.read_text()) == {"key": "value", "n": 42}
+
+    def test_no_temp_file_left(self, tmp_path: Path):
+        """書き込み完了後に .tmp ファイルが残らない。"""
+        target = tmp_path / "test.json"
+        atomic_write_json(target, {"k": "v"})
+        leftovers = list(tmp_path.glob("*.tmp"))
+        assert leftovers == []
+
+    def test_creates_parent_directories(self, tmp_path: Path):
+        """親ディレクトリがなくても作成される。"""
+        target = tmp_path / "deep" / "nested" / "file.json"
+        atomic_write_json(target, {"k": "v"})
+        assert target.exists()
+
+    def test_overwrite_preserves_old_on_failure(self, tmp_path: Path):
+        """古いファイルを上書きするとき、本体は壊れない（rename はアトミック）。"""
+        target = tmp_path / "test.json"
+        atomic_write_json(target, {"version": 1})
+        atomic_write_json(target, {"version": 2})
+        assert json.loads(target.read_text()) == {"version": 2}
+
+
+# ===========================================================================
+# 1000件スケール時のレポート（テスト兼ドキュメント）
+# ===========================================================================
 
 class TestScaleReport:
-    """1000件スケール時の設計妥当性レポート（テスト兼用）。"""
-
-    def test_print_scale_report(self, capsys):
+    def test_print_scale_report_1000(self, capsys):
         """1000アカウント時のバッチ数・推定リクエスト数を出力する。"""
         accounts = [f"user_{i}" for i in range(1000)]
         batches = split_into_batches(accounts)
-        daily_requests = len(batches) * 2  # 1日2回実行
+        daily_requests = len(batches) * 2
 
         print(f"\n--- 1000アカウントスケールレポート ---")
-        print(f"アカウント数     : {len(accounts)}")
-        print(f"バッチ数         : {len(batches)}")
+        print(f"アカウント数      : {len(accounts)}")
+        print(f"バッチ数          : {len(batches)}")
         print(f"最大バッチサイズ  : {max(len(b) for b in batches)} アカウント")
-        print(f"1日2回実行時     : {daily_requests} リクエスト/日")
+        print(f"1日2回実行時      : {daily_requests} リクエスト/日")
         print(f"X API制限（Basic）: 300 リクエスト/15分")
-        print(f"余裕率           : {300 / (daily_requests / (24 * 4)):.0f}x 以上の余裕")
 
-        # 1日のリクエスト数が現実的な範囲内か
         assert daily_requests < 100, f"1日{daily_requests}リクエストは想定より多い"
+
+    def test_print_scale_report_1500(self, capsys):
+        """1500アカウントでも余裕で動くことを示す。"""
+        accounts = [f"user_{i}" for i in range(1500)]
+        batches = split_into_batches(accounts)
+        daily_requests = len(batches) * 2
+
+        print(f"\n--- 1500アカウントスケールレポート ---")
+        print(f"アカウント数      : {len(accounts)}")
+        print(f"バッチ数          : {len(batches)}")
+        print(f"最大バッチサイズ  : {max(len(b) for b in batches)} アカウント")
+        print(f"1日2回実行時      : {daily_requests} リクエスト/日")
+
+        assert daily_requests < 150
